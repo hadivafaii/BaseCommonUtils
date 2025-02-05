@@ -425,6 +425,7 @@ def save_obj(
 		elif mode == 'html':
 			f.write(obj)
 		elif mode == 'json':
+			# noinspection PyTypeChecker
 			json.dump(obj, f, indent=4)
 		elif mode == 'txt':
 			for line in obj:

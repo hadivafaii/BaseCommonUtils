@@ -1,5 +1,6 @@
 from .utils_model import *
 from torch.utils.data import Dataset
+from .helper import rotate_img
 from PIL import ImageOps
 import torchvision
 
@@ -41,12 +42,80 @@ def make_dataset(
 	tst = None
 	load_dir = add_home(load_dir)
 
-	if dataset == 'vH16':
+	if dataset == 'RotatingMNIST':
 		defaults = dict(
-			n_blocks=100,
+			tau_context=16,
+			tau_pred=1,
+			delta_theta=8,
+			theta_0=None,
+		)
+		kwargs = setup_kwargs(defaults, kwargs)
+		kwargs.update({
+			'data_path': pjoin(load_dir, 'MNIST', 'processed'),
+			'device': device,
+		})
+		kwargs = filter_kwargs(RotatingMNIST, kwargs)
+		trn = RotatingMNIST(data_split='trn', seed=None, **kwargs)
+		vld = RotatingMNIST(data_split='vld', seed=0, **kwargs)
+
+	elif dataset.startswith('EyeMovies'):
+		defaults = dict(
+			tau_context=10,
+			tau_pred=1,
+			# preprocessing
+			rescale=True,
+			shift=False,
+			# trn/vld split
 			vld_portion=0.2,
+			n_blocks=3,
+		)
+		kwargs = setup_kwargs(defaults, kwargs)
+
+		n_pix = int_from_str(dataset)
+		data = pjoin(
+			load_dir,
+			'EyeMovies',
+			f"movies{n_pix}.npy",
+		)
+		data = np.load(data)
+
+		if kwargs['rescale']:
+			data /= 255.0
+
+		if kwargs['shift']:
+			data -= 0.5
+
+		trn_inds, vld_inds = split_data(
+			n_samples=len(data),
+			n_blocks=kwargs['n_blocks'],
+			vld_portion=kwargs['vld_portion'],
+		)
+		trn, vld = data[trn_inds], data[vld_inds]
+		trn, vld = map(
+			lambda a: torch.tensor(
+				data=a,
+				device=device,
+				dtype=torch.float),
+			[trn, vld],
+		)
+		trn = TemporalWindowDataset(
+			x=trn,
+			tau_context=kwargs['tau_context'],
+			tau_pred=kwargs['tau_pred'],
+		)
+		vld = TemporalWindowDataset(
+			x=vld,
+			tau_context=kwargs['tau_context'],
+			tau_pred=kwargs['tau_pred'],
+		)
+
+	elif dataset == 'vH16':
+		defaults = dict(
 			file_name='processed.npy',
 			shift_rescale=False,
+			# trn/vld split
+			vld_portion=0.2,
+			n_blocks=100,
 		)
 		kwargs = setup_kwargs(defaults, kwargs)
 
@@ -316,6 +385,123 @@ def make_dataset(
 		raise ValueError(dataset)
 
 	return trn, vld, tst
+
+
+class RotatingMNIST(Dataset):
+	def __init__(
+			self,
+			data_path: str,
+			data_split: str,
+			tau_context: int,
+			tau_pred: int = 1,
+			delta_theta: float = 8,
+			theta_0: float = None,
+			seed: int = None,
+			device: torch.device = None, ):
+		x = np.load(pjoin(data_path, f'x_{data_split}.npy'))  # imgs
+		g = np.load(pjoin(data_path, f'y_{data_split}.npy'))  # lbls
+		self.x = torch.tensor(x, device=device, dtype=torch.float)
+		self.g = torch.tensor(g, device=device, dtype=torch.float)
+
+		# self.data = np.load(data_path)  # Shape: [N, 28, 28]
+		self.tau_context = tau_context
+		self.tau_pred = tau_pred
+		self.delta_theta = delta_theta
+		self.theta_0 = theta_0
+
+		if seed is not None:
+			self.rng = get_rng(seed)
+		else:
+			self.rng = np.random
+
+	def __len__(self):
+		return len(self.x)
+
+	def __getitem__(self, idx):
+		# Get the original image
+		img = self.x[idx]
+
+		# Sample an initial rotation angle theta_0 randomly
+		if self.theta_0 is None:
+			theta_0 = self.rng.uniform(0, 360)
+		else:
+			theta_0 = self.theta_0
+
+		# Generate a sequence of rotated images
+		total_steps = self.tau_context + self.tau_pred
+		sequence = []
+		for i in range(total_steps):
+			# Compute current angle: theta_0 + i * delta_theta
+			current_angle = theta_0 + i * self.delta_theta
+			rotated_img = rotate_img(img, current_angle)
+			sequence.append(rotated_img)
+
+		sequence = torch.cat(sequence)  # Shape: [total_steps, 28, 28]
+
+		# Split into context (x) and prediction (y)
+		x = sequence[:self.tau_context]
+		y = sequence[self.tau_context:]
+
+		return x, y, self.g[idx]
+
+
+class TemporalWindowDataset(Dataset):
+	def __init__(
+			self,
+			x: torch.Tensor,
+			tau_context: int,
+			tau_pred: int = 1,
+	):
+		"""
+		Initialize the dataset with temporal sliding window parameters.
+
+		Args:
+			x (torch.Tensor): Input tensor of shape (n, npix, npix)
+				- n: total number of time points
+				- npix: spatial dimension
+			tau_context (int): Number of context frames
+			tau_pred (int): Number of prediction frames
+		"""
+		self.x = x
+		self.tau_context = tau_context
+		self.tau_pred = tau_pred
+
+	def __len__(self):
+		"""Return the number of valid samples in the dataset."""
+		return len(self.x) - self.tau_pred - self.tau_context
+
+	def __getitem__(self, idx):
+		"""
+		Get a single sample from the dataset.
+
+		Args:
+			idx (int): Index to get sample for
+
+		Returns:
+			tuple: (context_frames, prediction_frames)
+				  - context_frames: tensor of shape (tau_context, npix, npix)
+				  - prediction_frames: tensor of shape (tau_pred, npix, npix)
+		"""
+		# adjust index to account for context window
+		actual_idx = idx + self.tau_context
+
+		# get context & prediction frames
+		context_frames = self.x[actual_idx - self.tau_context:actual_idx]
+		prediction_frames = self.x[actual_idx:actual_idx + self.tau_pred]
+
+		return context_frames, prediction_frames
+
+	def get_dimensions(self):
+		"""
+		Return the dimensions of the data for a single sample.
+
+		Returns:
+			tuple: (context_shape, prediction_shape)
+		"""
+		npix = self.x.shape[1]  # x: (n, npix, npix)
+		context_shape = (self.tau_context, npix, npix)
+		prediction_shape = (self.tau_pred, npix, npix)
+		return context_shape, prediction_shape
 
 
 def split_data(
